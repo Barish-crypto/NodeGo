@@ -10,7 +10,7 @@ import displayBanner from './banner.js';
 
 const MAX_CONCURRENT_REQUESTS = 1000; // Tối ưu request song song
 const MAX_RETRIES = 2; // Số lần thử lại nếu lỗi
-const RETRY_DELAY = 5000; // 5 giây (giảm thời gian chờ)
+const RETRY_DELAY = 5000; // Thời gian chờ giữa các lần retry (5s)
 const limit = pLimit(MAX_CONCURRENT_REQUESTS);
 
 class NodeGoPinger {
@@ -22,7 +22,10 @@ class NodeGoPinger {
 
     createProxyAgent(proxyUrl) {
         try {
-            const parsedUrl = new URL(`http://${proxyUrl}`);
+            const parsedUrl = new URL(proxyUrl.includes('socks') ? proxyUrl : `http://${proxyUrl}`);
+            if (proxyUrl.startsWith('socks')) {
+                return { agent: new SocksProxyAgent(parsedUrl) };
+            }
             return {
                 httpAgent: new HttpProxyAgent(parsedUrl),
                 httpsAgent: new HttpsProxyAgent(parsedUrl),
@@ -43,7 +46,7 @@ class NodeGoPinger {
             },
             data,
             timeout: 10000,
-            ...(this.agent ? { httpAgent: this.agent.httpAgent, httpsAgent: this.agent.httpsAgent } : {}),
+            ...(this.agent ? { proxy: false, httpsAgent: this.agent.agent || this.agent.httpsAgent } : {}),
         };
 
         return axios(config);
@@ -60,8 +63,9 @@ class NodeGoPinger {
             console.error(chalk.red(`Ping lỗi (lần ${retryCount + 1}): ${error.message}`));
 
             if (retryCount < MAX_RETRIES) {
-                console.log(chalk.yellow(`🔄 Thử lại sau ${RETRY_DELAY / 1000}s...`));
-                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                const delay = RETRY_DELAY * (2 ** retryCount); // Exponential backoff
+                console.log(chalk.yellow(`🔄 Thử lại sau ${delay / 1000}s...`));
+                await new Promise(resolve => setTimeout(resolve, delay));
                 return this.ping(retryCount + 1);
             }
             throw new Error(`Ping thất bại sau ${MAX_RETRIES} lần thử.`);
@@ -116,8 +120,7 @@ class MultiAccountPinger {
 
     async runPinger() {
         displayBanner();
-
-        console.log(chalk.yellow('🚀 Bắt đầu chạy...'));
+        console.log(chalk.yellow('🚀 Bắt đầu chạy liên tục... Nhấn Ctrl + C để dừng.'));
 
         process.on('SIGINT', async () => {
             console.log(chalk.yellow('\n🛑 Đang dừng chương trình...'));
@@ -125,16 +128,18 @@ class MultiAccountPinger {
             process.exit(0);
         });
 
-        await this.loadAccounts();
+        while (true) {
+            await this.loadAccounts();
+            console.log(chalk.white(`📌 Chạy ${Math.min(this.accounts.length, MAX_CONCURRENT_REQUESTS)} proxy cùng lúc`));
 
-        console.log(chalk.white(`📌 Chạy ${Math.min(this.accounts.length, MAX_CONCURRENT_REQUESTS)} proxy cùng lúc`));
+            const tasks = this.accounts.map(account => limit(() => this.processSingleAccount(account)));
+            await Promise.allSettled(tasks);
 
-        const tasks = this.accounts.map(account => limit(() => this.processSingleAccount(account)));
+            await this.saveLogs();
+            console.log(chalk.green('🔄 Chu kỳ mới bắt đầu...'));
 
-        await Promise.allSettled(tasks); // Không dừng khi có lỗi
-
-        await this.saveLogs();
-        console.log(chalk.green('🎉 Hoàn thành!'));
+            await new Promise(resolve => setTimeout(resolve, 10000)); // Chờ 10 giây rồi lặp lại
+        }
     }
 
     async saveLogs() {
