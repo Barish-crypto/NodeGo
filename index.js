@@ -14,10 +14,10 @@ const RETRY_DELAY = 5000;
 const limit = pLimit(MAX_CONCURRENT_REQUESTS);
 
 class NodeGoPinger {
-    constructor(token, proxyUrl = null) {
+    constructor(token, proxyUrl) {
         this.apiBaseUrl = 'https://nodego.ai/api';
         this.bearerToken = token;
-        this.agent = proxyUrl ? this.createProxyAgent(proxyUrl) : null;
+        this.agent = this.createProxyAgent(proxyUrl);
     }
 
     createProxyAgent(proxyUrl) {
@@ -74,22 +74,14 @@ class MultiAccountPinger {
 
     async loadAccounts() {
         try {
-            const [accountData, proxyData] = await Promise.all([
-                fs.readFile('data.txt', 'utf8'),
-                fs.readFile('proxies.txt', 'utf8').catch(() => ''),
-            ]);
+            const accountData = await fs.readFile('data.txt', 'utf8');
+            const accounts = accountData.split('\n').filter(Boolean).map(line => {
+                const [token, proxy] = line.split('|').map(part => part.trim());
+                return { token, proxy };
+            });
 
-            const accounts = accountData.split('\n').filter(Boolean).map(token => token.trim());
-            const proxies = proxyData.split('\n').filter(Boolean).map(proxy => proxy.trim());
-            
-            proxies.sort(() => Math.random() - 0.5);
-            
-            this.accounts = accounts.map((token, index) => ({
-                token,
-                proxy: proxies[index % proxies.length] || null,
-            }));
-
-            console.log(chalk.green(`🔄 Tải ${this.accounts.length} tài khoản với ${proxies.length} proxy`));
+            this.accounts = accounts;
+            console.log(chalk.green(`🔄 Tải ${this.accounts.length} tài khoản với proxy tương ứng`));
         } catch (error) {
             console.error(chalk.red('Lỗi đọc file:'), error);
             process.exit(1);
