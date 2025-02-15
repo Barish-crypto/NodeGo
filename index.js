@@ -1,6 +1,6 @@
 import { readFile } from 'fs/promises';
 import { Pool } from 'undici';
-import { SocksProxyAgent } from 'socks-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import chalk from 'chalk';
 import pLimit from 'p-limit';
 
@@ -25,7 +25,7 @@ class NodeGoPinger {
 
     async pingWithProxy(proxy, retryCount = 0) {
         try {
-            const agent = proxy ? new SocksProxyAgent(`socks5://${proxy}`) : undefined;
+            const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
             const response = await this.client.request({
                 path: '/api/user/nodes/ping',
                 method: 'POST',
@@ -34,7 +34,7 @@ class NodeGoPinger {
                     'Content-Type': 'application/json' 
                 },
                 body: JSON.stringify({ type: 'extension' }),
-                dispatcher: agent // Sử dụng proxy nếu có
+                dispatcher: agent // Sử dụng HTTP proxy nếu có
             });
 
             if (response.statusCode === 429) throw new Error('Quá tải (429), chờ thử lại.');
