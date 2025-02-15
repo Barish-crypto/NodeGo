@@ -1,17 +1,16 @@
 {
-    "name": "nodego-pinger",
-    "version": "2.0.0",
-    "description": "Ping NodeGo API với nhiều tài khoản và proxy",
-    "main": "index.js",
-    "type": "module",
-    "scripts": {
-      "start": "node index.js"
-    },
-    "dependencies": {
-      "chalk": "^5.3.0",
-      "p-limit": "^4.0.0",
-      "socks-proxy-agent": "^7.0.0",
-      "undici": "^5.24.0"
-    }
+  "name": "nodego-pinger",
+  "version": "3.0.0",
+  "description": "Ping NodeGo API với nhiều tài khoản và proxy",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "p-limit": "^4.0.0",
+    "socks-proxy-agent": "^7.0.0",
+    "undici": "^5.25.0"
   }
-  
+}
