@@ -1,67 +1,83 @@
-import { readFile } from 'fs/promises';
-import { Pool } from 'undici';
+import fs from 'fs';
+import axios from 'axios';
+import { URL } from 'url';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { HttpProxyAgent } from 'http-proxy-agent';
 import chalk from 'chalk';
 import pLimit from 'p-limit';
 
-const API_URL = 'https://nodego.ai/api/user/nodes/ping';
-const MAX_CONCURRENT_REQUESTS = 5000;
-const RETRY_DELAY = 1000; // 1 giây trước khi thử lại proxy khác
+const API_BASE_URL = 'https://nodego.ai/api';
+const MAX_CONCURRENT_REQUESTS = 100; // Giới hạn tối đa 100 tài khoản ping song song
+const RETRY_DELAY = 5000; // 5 giây trước khi thử lại nếu thất bại
 
 const limit = pLimit(MAX_CONCURRENT_REQUESTS);
 
 class NodeGoPinger {
-    constructor(token, proxies) {
+    constructor(token, proxyUrl = null) {
         this.token = token;
-        this.proxies = proxies;
-        this.proxyIndex = 0;
-        this.client = new Pool('https://nodego.ai', {
-            connections: 2000,
-            pipelining: 10,
-            keepAliveTimeout: 30_000,
-            keepAliveMaxTimeout: 60_000
-        });
+        this.agent = proxyUrl ? this.createProxyAgent(proxyUrl) : null;
     }
 
-    getNextProxy() {
-        const proxy = this.proxies[this.proxyIndex % this.proxies.length]; // Lấy proxy theo vòng tròn
-        this.proxyIndex++;
-        return proxy;
-    }
-
-    async pingWithProxy(proxy) {
+    createProxyAgent(proxyUrl) {
         try {
-            const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
-            const response = await this.client.request({
-                path: '/api/user/nodes/ping',
-                method: 'POST',
-                headers: { 
-                    'Authorization': `Bearer ${this.token}`, 
-                    'Content-Type': 'application/json' 
-                },
-                body: JSON.stringify({ type: 'extension' }),
-                dispatcher: agent
-            });
-
-            if (response.statusCode === 429) throw new Error('Quá tải (429), thử proxy khác.');
-            if (response.statusCode !== 200) throw new Error(`HTTP ${response.statusCode}`);
-
-            const data = await response.body.json();
-            return data.metadata?.id || null;
+            const parsedUrl = new URL(proxyUrl);
+            if (proxyUrl.startsWith('socks')) {
+                return new SocksProxyAgent(parsedUrl);
+            } else {
+                return {
+                    httpAgent: new HttpProxyAgent(parsedUrl),
+                    httpsAgent: new HttpsProxyAgent(parsedUrl)
+                };
+            }
         } catch (error) {
+            console.error(chalk.red('❌ Lỗi proxy:'), error.message);
+            return null;
+        }
+    }
+
+    async makeRequest(method, endpoint, data = null) {
+        const config = {
+            method,
+            url: `${API_BASE_URL}${endpoint}`,
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/json',
+            },
+            ...(data && { data }),
+            timeout: 10000, // 10 giây timeout
+        };
+
+        if (this.agent) {
+            config.httpAgent = this.agent.httpAgent || this.agent;
+            config.httpsAgent = this.agent.httpsAgent || this.agent;
+        }
+
+        try {
+            const response = await axios(config);
+            return response.data;
+        } catch (error) {
+            console.error(chalk.red(`❌ Request thất bại: ${error.message}`));
             return null;
         }
     }
 
     async ping() {
-        while (true) {
-            for (let i = 0; i < this.proxies.length; i++) {
-                const proxy = this.getNextProxy();
-                const metadataId = await this.pingWithProxy(proxy);
-                if (metadataId) return metadataId;
+        let success = false;
+        while (!success) {
+            try {
+                const response = await this.makeRequest('POST', '/user/nodes/ping', { type: 'extension' });
+                if (response) {
+                    console.log(chalk.green(`✅ Ping thành công! Token: ${this.token.slice(0, 10)}...`));
+                    success = true;
+                } else {
+                    console.log(chalk.yellow(`🔄 Thử lại ping sau ${RETRY_DELAY / 1000} giây...`));
+                    await new Promise(res => setTimeout(res, RETRY_DELAY));
+                }
+            } catch (error) {
+                console.error(chalk.red(`🚨 Lỗi khi ping, thử lại sau ${RETRY_DELAY / 1000} giây...`));
+                await new Promise(res => setTimeout(res, RETRY_DELAY));
             }
-            console.log(chalk.red(`🔄 Tất cả proxy thất bại! Thử lại sau 10 giây...`));
-            await new Promise(r => setTimeout(r, 10_000));
         }
     }
 }
@@ -73,48 +89,53 @@ class MultiAccountPinger {
     }
 
     async loadProxies() {
-        const proxies = await readFile('proxies.txt', 'utf8').catch(() => '');
-        this.proxies = proxies.trim().split('\n').filter(Boolean);
+        if (fs.existsSync('proxies.txt')) {
+            const proxyData = fs.readFileSync('proxies.txt', 'utf8').split('\n').map(p => p.trim()).filter(Boolean);
+            this.proxies = proxyData.length > 0 ? proxyData : [null]; // Nếu không có proxy, dùng kết nối trực tiếp
+        } else {
+            console.log(chalk.yellow('⚠️ Không tìm thấy proxies.txt! Sử dụng kết nối trực tiếp.'));
+            this.proxies = [null];
+        }
     }
 
-    async *loadAccounts() {
-        const accounts = await readFile('data.txt', 'utf8');
-        const tokens = accounts.trim().split('\n').filter(Boolean);
-
-        if (tokens.length !== 500) {
-            console.log(chalk.red(`❌ Không đủ 500 tài khoản! Hiện có: ${tokens.length}`));
+    async loadAccounts() {
+        if (!fs.existsSync('data.txt')) {
+            console.error(chalk.red('❌ Không tìm thấy data.txt! Hãy thêm 500 token vào file này.'));
             process.exit(1);
         }
 
-        for (const token of tokens) {
-            yield { token, proxies: [...this.proxies] };
+        const accounts = fs.readFileSync('data.txt', 'utf8').split('\n').map(a => a.trim()).filter(Boolean);
+        if (accounts.length < 500) {
+            console.log(chalk.red(`⚠️ Chỉ có ${accounts.length} tài khoản trong data.txt!`));
+            process.exit(1);
         }
+
+        this.accounts = accounts.map((token, index) => ({
+            token,
+            proxy: this.proxies[index % this.proxies.length], // Sử dụng proxy theo vòng tròn
+        }));
     }
 
-    async processSingleAccount({ token, proxies }) {
-        const pinger = new NodeGoPinger(token, proxies);
-        const metadataId = await pinger.ping();
-        if (metadataId) {
-            console.log(chalk.green(`✅ Thành công! ID: ${metadataId} | Dùng Proxy: ${proxies[0]}`));
-        } else {
-            console.log(chalk.red(`❌ Thất bại! Token: ${token}, tất cả proxy đều không hoạt động.`));
-        }
+    async processSingleAccount(account) {
+        const pinger = new NodeGoPinger(account.token, account.proxy);
+        await pinger.ping();
     }
 
     async runPinger() {
-        console.log(chalk.yellow('🚀 Đang chạy... Nhấn Ctrl + C để dừng.'));
-        
+        console.log(chalk.cyan('🚀 Khởi động hệ thống ping...'));
         await this.loadProxies();
+        await this.loadAccounts();
 
-        const tasks = [];
-        for await (const account of this.loadAccounts()) {
-            tasks.push(limit(() => this.processSingleAccount(account)));
+        while (true) {
+            console.log(chalk.yellow(`⏳ Bắt đầu vòng ping mới... (${new Date().toLocaleTimeString()})`));
+
+            await Promise.all(
+                this.accounts.map(account => limit(() => this.processSingleAccount(account)))
+            );
+
+            console.log(chalk.green('✅ Vòng ping hoàn tất! Chờ 10 giây trước khi tiếp tục...'));
+            await new Promise(res => setTimeout(res, 10_000));
         }
-
-        await Promise.all(tasks);
-        console.log(chalk.green('🔄 Hoàn tất vòng chạy, bắt đầu lại sau 10 giây...'));
-        await new Promise(r => setTimeout(r, 10_000));
-        this.runPinger(); // Lặp lại vô hạn
     }
 }
 
