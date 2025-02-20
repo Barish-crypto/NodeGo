@@ -1,4 +1,4 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import axios from 'axios';
 import { URL } from 'url';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -6,32 +6,29 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import chalk from 'chalk';
 import pLimit from 'p-limit';
+import displayBanner from './banner.js';
 
-const API_BASE_URL = 'https://nodego.ai/api';
-const MAX_CONCURRENT_REQUESTS = 100; // Giới hạn tối đa 100 tài khoản ping song song
-const RETRY_DELAY = 5000; // 5 giây trước khi thử lại nếu thất bại
-
+const MAX_CONCURRENT_REQUESTS = 1000;
+const MAX_RETRIES = 2;
+const RETRY_DELAY = 5000;
 const limit = pLimit(MAX_CONCURRENT_REQUESTS);
 
 class NodeGoPinger {
     constructor(token, proxyUrl = null) {
-        this.token = token;
+        this.apiBaseUrl = 'https://nodego.ai/api';
+        this.bearerToken = token;
         this.agent = proxyUrl ? this.createProxyAgent(proxyUrl) : null;
     }
 
     createProxyAgent(proxyUrl) {
         try {
-            const parsedUrl = new URL(proxyUrl);
-            if (proxyUrl.startsWith('socks')) {
-                return new SocksProxyAgent(parsedUrl);
-            } else {
-                return {
-                    httpAgent: new HttpProxyAgent(parsedUrl),
-                    httpsAgent: new HttpsProxyAgent(parsedUrl)
-                };
-            }
+            const parsedUrl = new URL(`http://${proxyUrl}`);
+            return {
+                httpAgent: new HttpProxyAgent(parsedUrl),
+                httpsAgent: new HttpsProxyAgent(parsedUrl),
+            };
         } catch (error) {
-            console.error(chalk.red('❌ Lỗi proxy:'), error.message);
+            console.error(chalk.red(`Lỗi Proxy: ${proxyUrl} - ${error.message}`));
             return null;
         }
     }
@@ -39,45 +36,35 @@ class NodeGoPinger {
     async makeRequest(method, endpoint, data = null) {
         const config = {
             method,
-            url: `${API_BASE_URL}${endpoint}`,
+            url: `${this.apiBaseUrl}${endpoint}`,
             headers: {
-                'Authorization': `Bearer ${this.token}`,
+                'Authorization': `Bearer ${this.bearerToken}`,
                 'Content-Type': 'application/json',
             },
-            ...(data && { data }),
-            timeout: 10000, // 10 giây timeout
+            data,
+            timeout: 10000,
+            ...(this.agent ? { httpAgent: this.agent.httpAgent, httpsAgent: this.agent.httpsAgent } : {}),
         };
 
-        if (this.agent) {
-            config.httpAgent = this.agent.httpAgent || this.agent;
-            config.httpsAgent = this.agent.httpsAgent || this.agent;
-        }
-
-        try {
-            const response = await axios(config);
-            return response.data;
-        } catch (error) {
-            console.error(chalk.red(`❌ Request thất bại: ${error.message}`));
-            return null;
-        }
+        return axios(config);
     }
 
-    async ping() {
-        let success = false;
-        while (!success) {
-            try {
-                const response = await this.makeRequest('POST', '/user/nodes/ping', { type: 'extension' });
-                if (response) {
-                    console.log(chalk.green(`✅ Ping thành công! Token: ${this.token.slice(0, 10)}...`));
-                    success = true;
-                } else {
-                    console.log(chalk.yellow(`🔄 Thử lại ping sau ${RETRY_DELAY / 1000} giây...`));
-                    await new Promise(res => setTimeout(res, RETRY_DELAY));
-                }
-            } catch (error) {
-                console.error(chalk.red(`🚨 Lỗi khi ping, thử lại sau ${RETRY_DELAY / 1000} giây...`));
-                await new Promise(res => setTimeout(res, RETRY_DELAY));
+    async ping(retryCount = 0) {
+        try {
+            const response = await this.makeRequest('POST', '/user/nodes/ping', { type: 'extension' });
+            return {
+                statusCode: response.status,
+                metadataId: response.data.metadata.id,
+            };
+        } catch (error) {
+            console.error(chalk.red(`Ping lỗi (lần ${retryCount + 1}): ${error.message}`));
+
+            if (retryCount < MAX_RETRIES) {
+                console.log(chalk.yellow(`🔄 Thử lại sau ${RETRY_DELAY / 1000}s...`));
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                return this.ping(retryCount + 1);
             }
+            throw new Error(`Ping thất bại sau ${MAX_RETRIES} lần thử.`);
         }
     }
 }
@@ -85,58 +72,76 @@ class NodeGoPinger {
 class MultiAccountPinger {
     constructor() {
         this.accounts = [];
-        this.proxies = [];
-    }
-
-    async loadProxies() {
-        if (fs.existsSync('proxies.txt')) {
-            const proxyData = fs.readFileSync('proxies.txt', 'utf8').split('\n').map(p => p.trim()).filter(Boolean);
-            this.proxies = proxyData.length > 0 ? proxyData : [null]; // Nếu không có proxy, dùng kết nối trực tiếp
-        } else {
-            console.log(chalk.yellow('⚠️ Không tìm thấy proxies.txt! Sử dụng kết nối trực tiếp.'));
-            this.proxies = [null];
-        }
+        this.successLog = [];
+        this.errorLog = [];
     }
 
     async loadAccounts() {
-        if (!fs.existsSync('data.txt')) {
-            console.error(chalk.red('❌ Không tìm thấy data.txt! Hãy thêm 500 token vào file này.'));
+        try {
+            const [accountData, proxyData] = await Promise.all([
+                fs.readFile('data.txt', 'utf8'),
+                fs.readFile('proxies.txt', 'utf8').catch(() => ''),
+            ]);
+
+            const accounts = accountData.split('\n').filter(Boolean).map(token => token.trim());
+            const proxies = proxyData.split('\n').filter(Boolean).map(proxy => proxy.trim());
+
+            proxies.sort(() => Math.random() - 0.5);
+
+            this.accounts = accounts.map((token, index) => ({
+                token,
+                proxy: proxies[index % proxies.length] || null,
+            }));
+
+            console.log(chalk.green(`🔄 Tải ${this.accounts.length} tài khoản với ${proxies.length} proxy`));
+        } catch (error) {
+            console.error(chalk.red('Lỗi đọc file:'), error);
             process.exit(1);
         }
-
-        const accounts = fs.readFileSync('data.txt', 'utf8').split('\n').map(a => a.trim()).filter(Boolean);
-        if (accounts.length < 500) {
-            console.log(chalk.red(`⚠️ Chỉ có ${accounts.length} tài khoản trong data.txt!`));
-            process.exit(1);
-        }
-
-        this.accounts = accounts.map((token, index) => ({
-            token,
-            proxy: this.proxies[index % this.proxies.length], // Sử dụng proxy theo vòng tròn
-        }));
     }
 
     async processSingleAccount(account) {
         const pinger = new NodeGoPinger(account.token, account.proxy);
-        await pinger.ping();
+
+        try {
+            const pingResponse = await pinger.ping();
+            console.log(chalk.green(`✅ Ping OK! Proxy: ${account.proxy} | ID: ${pingResponse.metadataId}`));
+
+            this.successLog.push(`${account.token} | Proxy: ${account.proxy} | ID: ${pingResponse.metadataId}`);
+        } catch (error) {
+            console.error(chalk.red(`❌ Lỗi tài khoản ${account.token} với Proxy ${account.proxy}: ${error.message}`));
+            this.errorLog.push(`${account.token} | Proxy: ${account.proxy} | Lỗi: ${error.message}`);
+        }
     }
 
     async runPinger() {
-        console.log(chalk.cyan('🚀 Khởi động hệ thống ping...'));
-        await this.loadProxies();
+        displayBanner();
+
+        console.log(chalk.yellow('🚀 Bắt đầu chạy...'));
+
+        process.on('SIGINT', async () => {
+            console.log(chalk.yellow('\n🛑 Đang dừng chương trình...'));
+            await this.saveLogs();
+            process.exit(0);
+        });
+
         await this.loadAccounts();
 
+        console.log(chalk.white(`📌 Chạy ${Math.min(this.accounts.length, MAX_CONCURRENT_REQUESTS)} proxy cùng lúc`));
+
+        const tasks = this.accounts.map(account => limit(() => this.processSingleAccount(account)));
+
         while (true) {
-            console.log(chalk.yellow(`⏳ Bắt đầu vòng ping mới... (${new Date().toLocaleTimeString()})`));
-
-            await Promise.all(
-                this.accounts.map(account => limit(() => this.processSingleAccount(account)))
-            );
-
-            console.log(chalk.green('✅ Vòng ping hoàn tất! Chờ 10 giây trước khi tiếp tục...'));
-            await new Promise(res => setTimeout(res, 10_000));
+            await Promise.allSettled(tasks);
         }
+    }
+
+    async saveLogs() {
+        if (this.successLog.length) await fs.appendFile('success.log', this.successLog.join('\n') + '\n');
+        if (this.errorLog.length) await fs.appendFile('error.log', this.errorLog.join('\n') + '\n');
     }
 }
 
-new MultiAccountPinger().runPinger();
+const multiPinger = new MultiAccountPinger();
+multiPinger.runPinger();
+
